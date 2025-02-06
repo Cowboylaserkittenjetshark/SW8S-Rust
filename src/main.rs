@@ -1,482 +1,65 @@
-use anyhow::{bail, Result};
-use config::Configuration;
-use std::env::temp_dir;
-
 use std::env;
-use std::process::exit;
-use sw8s_rust_lib::{
-    comms::{
-        control_board::{ControlBoard, SensorStatuses},
-        meb::MainElectronicsBoard,
-    },
-    logln,
-    missions::{
-        action::ActionExec,
-        action_context::FullActionContext,
-        align_buoy::{buoy_align, buoy_align_shot},
-        basic::descend_and_go_forward,
-        circle_buoy::{
-            buoy_circle_sequence, buoy_circle_sequence_blind, buoy_circle_sequence_model,
-        },
-        coinflip::coinflip,
-        example::initial_descent,
-        fancy_octagon::fancy_octagon,
-        fire_torpedo::{FireLeftTorpedo, FireRightTorpedo},
-        gate::{gate_run_complex, gate_run_naive, gate_run_testing},
-        meb::WaitArm,
-        octagon::octagon,
-        path_align::path_align,
-        reset_torpedo::ResetTorpedo,
-        spin::spin,
-        vision::PIPELINE_KILL,
-    },
-    video_source::appsink::Camera,
-    vision::buoy::Target,
-    TIMESTAMP,
-};
-use tokio::{
-    io::WriteHalf,
-    signal,
-    sync::{
-        mpsc::{self, UnboundedSender},
-        OnceCell, RwLock,
-    },
-    time::{sleep, timeout},
-};
-use tokio_serial::SerialStream;
-pub mod config;
-use std::time::Duration;
+use std::time::Instant;
 
-static CONTROL_BOARD_CELL: OnceCell<ControlBoard<WriteHalf<SerialStream>>> = OnceCell::const_new();
-async fn control_board() -> &'static ControlBoard<WriteHalf<SerialStream>> {
-    CONTROL_BOARD_CELL
-        .get_or_init(|| async {
-            let board = ControlBoard::serial(&Configuration::default().control_board_path).await;
-            match board {
-                Ok(x) => x,
-                Err(e) => {
-                    logln!("Error initializing control board: {:#?}", e);
-                    let backup_board =
-                        ControlBoard::serial(&Configuration::default().control_board_backup_path)
-                            .await
-                            .unwrap();
-                    backup_board.reset().await.unwrap();
-                    ControlBoard::serial(&Configuration::default().control_board_path)
-                        .await
-                        .unwrap()
-                }
-            }
-        })
-        .await
-}
+use opencv::core::Size;
+use opencv::prelude::*;
+use opencv::{core, imgcodecs, imgproc, Result};
 
-static MEB_CELL: OnceCell<MainElectronicsBoard<WriteHalf<SerialStream>>> = OnceCell::const_new();
-async fn meb() -> &'static MainElectronicsBoard<WriteHalf<SerialStream>> {
-    MEB_CELL
-        .get_or_init(|| async {
-            MainElectronicsBoard::<WriteHalf<SerialStream>>::serial(
-                &Configuration::default().meb_path,
-            )
-            .await
-            .unwrap()
-        })
-        .await
-}
+const ITERATIONS: usize = 100;
 
-static FRONT_CAM_CELL: OnceCell<Camera> = OnceCell::const_new();
-async fn front_cam() -> &'static Camera {
-    FRONT_CAM_CELL
-        .get_or_init(|| async {
-            Camera::jetson_new(
-                &Configuration::default().front_cam,
-                "front",
-                &temp_dir().join("cams_".to_string() + &TIMESTAMP),
-            )
-            .unwrap()
-        })
-        .await
-}
+fn main() -> Result<()> {
+	let img_file = env::args().nth(1).expect("Please supply image file name");
 
-static BOTTOM_CAM_CELL: OnceCell<Camera> = OnceCell::const_new();
-async fn bottom_cam() -> &'static Camera {
-    BOTTOM_CAM_CELL
-        .get_or_init(|| async {
-            Camera::jetson_new(
-                &Configuration::default().bottom_cam,
-                "bottom",
-                &temp_dir().join("cams_".to_string() + &TIMESTAMP),
-            )
-            .unwrap()
-        })
-        .await
-}
+	let dev_count = core::get_cuda_enabled_device_count()?;
+	let cuda_available = dev_count > 0;
+	if cuda_available {
+		for dev_num in 0..dev_count {
+			core::print_short_cuda_device_info(dev_num)?;
+		}
+	}
+	println!(
+		"CUDA is {}",
+		if cuda_available {
+			"available"
+		} else {
+			"not available"
+		}
+	);
+	println!("Timing CPU implementation... ");
+	let img = imgcodecs::imread_def(&img_file)?;
+	let start = Instant::now();
+	for _ in 0..ITERATIONS {
+		let mut gray = Mat::default();
+		imgproc::cvt_color_def(&img, &mut gray, imgproc::COLOR_BGR2GRAY)?;
+		let mut blurred = Mat::default();
+		imgproc::gaussian_blur_def(&gray, &mut blurred, Size::new(7, 7), 1.5)?;
+		let mut edges = Mat::default();
+		imgproc::canny_def(&blurred, &mut edges, 0., 50.)?;
+	}
+	println!("{:#?}", start.elapsed());
+	// #[cfg(all(ocvrs_has_module_cudafilters, ocvrs_has_module_cudaimgproc))]
+	if cuda_available {
+		use opencv::core::GpuMat;
+		use opencv::{cudafilters, cudaimgproc};
 
-static GATE_TARGET: OnceCell<RwLock<Target>> = OnceCell::const_new();
-async fn gate_target() -> &'static RwLock<Target> {
-    GATE_TARGET
-        .get_or_init(|| async { RwLock::new(Target::Earth1) })
-        .await
-}
-
-static STATIC_CONTEXT: OnceCell<FullActionContext<WriteHalf<SerialStream>>> = OnceCell::const_new();
-async fn static_context() -> &'static FullActionContext<'static, WriteHalf<SerialStream>> {
-    STATIC_CONTEXT
-        .get_or_init(|| async {
-            FullActionContext::new(
-                control_board().await,
-                meb().await,
-                front_cam().await,
-                bottom_cam().await,
-                gate_target().await,
-            )
-        })
-        .await
-}
-
-#[tokio::main]
-async fn main() {
-    let shutdown_tx = shutdown_handler().await;
-    let _config = Configuration::default();
-
-    let orig_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |panic_info| {
-        orig_hook(panic_info);
-        exit(1);
-    }));
-
-    let shutdown_tx_clone = shutdown_tx.clone();
-    tokio::spawn(async move {
-        let meb = meb().await;
-
-        // Wait for arm condition
-        while meb.thruster_arm().await != Some(true) {
-            sleep(Duration::from_secs(1)).await;
-        }
-
-        // Wait for disarm condition
-        while meb.thruster_arm().await != Some(false) {
-            sleep(Duration::from_secs(1)).await;
-        }
-
-        shutdown_tx_clone.send(1).unwrap();
-    });
-
-    for arg in env::args().skip(1).collect::<Vec<String>>() {
-        run_mission(&arg).await.unwrap();
-    }
-
-    // Send shutdown signal
-    shutdown_tx.send(0).unwrap();
-}
-
-/// Graceful shutdown, see <https://tokio.rs/tokio/topics/shutdown>
-async fn shutdown_handler() -> UnboundedSender<i32> {
-    let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<i32>();
-    tokio::spawn(async move {
-        // Wait for shutdown signal
-        let exit_status = tokio::select! {_ = signal::ctrl_c() => {
-        logln!("CTRL-C RECV");
-        1 }, Some(x) = shutdown_rx.recv() => {
-            logln!("SHUTDOWN SIGNAL RECV");
-            x }};
-
-        let status = control_board().await.sensor_status_query().await;
-
-        match status.unwrap() {
-            SensorStatuses::ImuNr => {
-                logln!("imu not ready");
-            }
-            SensorStatuses::DepthNr => {
-                logln!("depth not ready");
-            }
-            _ => {}
-        }
-
-        // Stop motors
-        if let Some(control_board) = CONTROL_BOARD_CELL.get() {
-            control_board
-                .relative_dof_speed_set_batch(&[0.0; 6])
-                .await
-                .unwrap();
-        };
-
-        // Reset Torpedo
-        ResetTorpedo::new(static_context().await).execute().await;
-
-        // If shutdown is unexpected, immediately exit nonzero
-        if exit_status != 0 {
-            exit(exit_status)
-        };
-    });
-    shutdown_tx
-}
-
-async fn run_mission(mission: &str) -> Result<()> {
-    let res = match mission.to_lowercase().as_str() {
-        "arm" => {
-            WaitArm::new(static_context().await).execute().await;
-            Ok(())
-        }
-        "empty" => {
-            let control_board = control_board().await;
-            control_board
-                .raw_speed_set([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
-                .await
-                .unwrap();
-            sleep(Duration::from_millis(1000)).await;
-            logln!("1");
-            control_board
-                .raw_speed_set([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0])
-                .await
-                .unwrap();
-            sleep(Duration::from_millis(1000)).await;
-            logln!("2");
-            control_board
-                .raw_speed_set([0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0])
-                .await
-                .unwrap();
-            sleep(Duration::from_millis(1000)).await;
-            logln!("3");
-            control_board
-                .raw_speed_set([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-                .await
-                .unwrap();
-            logln!("4");
-            Ok(())
-        }
-        "depth_test" | "depth-test" => {
-            let _control_board = control_board().await;
-            logln!("Init ctrl");
-            sleep(Duration::from_millis(1000)).await;
-            logln!("End sleep");
-            logln!("Starting depth hold...");
-            loop {
-                if let Ok(ret) = timeout(
-                    Duration::from_secs(1),
-                    control_board()
-                        .await
-                        .stability_1_speed_set(0.0, 0.0, 0.0, 0.0, 0.0, -1.3),
-                )
-                .await
-                {
-                    ret?;
-                    break;
-                }
-            }
-            sleep(Duration::from_secs(5)).await;
-            logln!("Finished depth hold");
-            Ok(())
-        }
-        "travel_test" | "travel-test" => {
-            logln!("Starting travel...");
-            loop {
-                if let Ok(ret) = timeout(
-                    Duration::from_secs(1),
-                    control_board()
-                        .await
-                        .stability_2_speed_set(0.0, 0.5, 0.0, 0.0, 70.0, -1.3),
-                )
-                .await
-                {
-                    ret?;
-                    break;
-                }
-            }
-            sleep(Duration::from_secs(10)).await;
-            logln!("Finished travel");
-            Ok(())
-        }
-        "surface_" | "surface-test" => {
-            logln!("Starting travel...");
-            loop {
-                if let Ok(ret) = timeout(
-                    Duration::from_secs(1),
-                    control_board()
-                        .await
-                        .stability_1_speed_set(0.0, 0.5, 0.0, 0.0, 0.0, 0.0),
-                )
-                .await
-                {
-                    ret?;
-                    break;
-                }
-            }
-            sleep(Duration::from_secs(10)).await;
-            logln!("Finished travel");
-            Ok(())
-        }
-        "descend" | "forward" => {
-            let _ = descend_and_go_forward(&FullActionContext::new(
-                control_board().await,
-                meb().await,
-                front_cam().await,
-                bottom_cam().await,
-                gate_target().await,
-            ))
-            .execute()
-            .await;
-            Ok(())
-        }
-        "gate_run_naive" => {
-            let _ = gate_run_naive(&FullActionContext::new(
-                control_board().await,
-                meb().await,
-                front_cam().await,
-                bottom_cam().await,
-                gate_target().await,
-            ))
-            .execute()
-            .await;
-            Ok(())
-        }
-        "gate_run_complex" => {
-            let _ = gate_run_complex(&FullActionContext::new(
-                control_board().await,
-                meb().await,
-                front_cam().await,
-                bottom_cam().await,
-                gate_target().await,
-            ))
-            .execute()
-            .await;
-            Ok(())
-        }
-        "gate_run_testing" => {
-            let _ = gate_run_testing(&FullActionContext::new(
-                control_board().await,
-                meb().await,
-                front_cam().await,
-                bottom_cam().await,
-                gate_target().await,
-            ))
-            .execute()
-            .await;
-            Ok(())
-        }
-        "start_cam" => {
-            // This has not been tested
-            logln!("Opening camera");
-            front_cam().await;
-            bottom_cam().await;
-            logln!("Opened camera");
-            Ok(())
-        }
-        "path_align" => {
-            let _ = path_align(&FullActionContext::new(
-                control_board().await,
-                meb().await,
-                front_cam().await,
-                bottom_cam().await,
-                gate_target().await,
-            ))
-            .execute()
-            .await;
-            Ok(())
-        }
-        /*
-        "buoy_circle" => {
-            bail!("TODO");
-            let _ = gate_run(&FullActionContext::new(
-                control_board().await,
-                meb().await,
-                front_cam().await,bottom_cam().await,
-                gate_target().await,
-            ))
-            .execute()
-            .await;
-            Ok(())
-        }
-        */
-        "example" => {
-            let _ = initial_descent(&FullActionContext::new(
-                control_board().await,
-                meb().await,
-                front_cam().await,
-                bottom_cam().await,
-                gate_target().await,
-            ))
-            .execute()
-            .await;
-            Ok(())
-        }
-        "octagon" => {
-            let _ = octagon(static_context().await).execute().await;
-            Ok(())
-        }
-        "fancy_octagon" => {
-            let _ = fancy_octagon(static_context().await).execute().await;
-            Ok(())
-        }
-        "buoy_circle" => {
-            let _ = buoy_circle_sequence(&FullActionContext::new(
-                control_board().await,
-                meb().await,
-                front_cam().await,
-                bottom_cam().await,
-                gate_target().await,
-            ))
-            .execute()
-            .await;
-            Ok(())
-        }
-        "buoy_model" => {
-            let _ = buoy_circle_sequence_model(static_context().await)
-                .execute()
-                .await;
-            Ok(())
-        }
-        "buoy_blind" => {
-            let _ = buoy_circle_sequence_blind(static_context().await)
-                .execute()
-                .await;
-            Ok(())
-        }
-        "buoy_align" => {
-            let _ = buoy_align(static_context().await).execute().await;
-            Ok(())
-        }
-        "spin" => {
-            let _ = spin(static_context().await).execute().await;
-            Ok(())
-        }
-        "torpedo" | "fire_torpedo" => {
-            let _ = buoy_align_shot(static_context().await).execute().await;
-            Ok(())
-        }
-        "torpedo_only" => {
-            FireRightTorpedo::new(static_context().await)
-                .execute()
-                .await;
-            FireLeftTorpedo::new(static_context().await).execute().await;
-            Ok(())
-        }
-        "coinflip" => {
-            let _ = coinflip(static_context().await).execute().await;
-            Ok(())
-        }
-        // Just stall out forever
-        "forever" | "infinite" => loop {
-            while control_board().await.raw_speed_set([0.0; 8]).await.is_err() {}
-            sleep(Duration::from_secs(u64::MAX)).await;
-        },
-        "open_cam_test" => {
-            Camera::jetson_new(
-                &Configuration::default().bottom_cam,
-                "front",
-                &temp_dir().join("cams_".to_string() + &TIMESTAMP),
-            )
-            .unwrap();
-            Ok(())
-        }
-        x => bail!("Invalid argument: [{x}]"),
-    };
-
-    // Kill any vision pipelines
-    PIPELINE_KILL.write().unwrap().1 = true;
-    while PIPELINE_KILL.read().unwrap().0 > 0 {
-        sleep(Duration::from_millis(100)).await;
-    }
-    PIPELINE_KILL.write().unwrap().1 = false;
-
-    res
+		println!("Timing CUDA implementation... ");
+		let img = imgcodecs::imread_def(&img_file)?;
+		let mut img_gpu = GpuMat::new_def()?;
+		img_gpu.upload(&img)?;
+		let mut stream = core::Stream::default()?;
+		let start = Instant::now();
+		for _ in 0..ITERATIONS {
+			let mut gray = GpuMat::new_def()?;
+			cudaimgproc::cvt_color(&img_gpu, &mut gray, imgproc::COLOR_BGR2GRAY, 0, &mut stream)?;
+			let mut blurred = GpuMat::new_def()?;
+			let mut filter = cudafilters::create_gaussian_filter_def(gray.typ()?, blurred.typ()?, Size::new(7, 7), 1.5)?;
+			filter.apply(&gray, &mut blurred, &mut stream)?;
+			let mut edges = GpuMat::new_def()?;
+			let mut detector = cudaimgproc::create_canny_edge_detector_def(0., 50.)?;
+			detector.detect(&blurred, &mut edges, &mut stream)?;
+			stream.wait_for_completion()?;
+		}
+		println!("{:#?}", start.elapsed());
+	}
+	Ok(())
 }

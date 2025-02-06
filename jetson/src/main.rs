@@ -65,37 +65,39 @@ async fn main() {
 
         println!("Testing for sysroot");
         if !sysroot.exists() {
-            // Streaming this process reduces I/O and reduces delay
-            println!("Downloading sysroot...");
+            println!("Did not find sysroot. Unpack to {}", sysroot.display());
+            panic!()
+        //     // Streaming this process reduces I/O and reduces delay
+        //     println!("Downloading sysroot...");
 
-            let source = reqwest::get("https://github.com/MB3hel/RustCrossExperiments/releases/download/demosysroot/sysroot-jetson.tar.xz").await.unwrap();
+        //     let source = reqwest::get("https://github.com/MB3hel/RustCrossExperiments/releases/download/demosysroot/sysroot-jetson.tar.xz").await.unwrap();
 
-            multibar.set_move_cursor(true); // Reduce flickering
-            let dl_bar = multibar.add(ProgressBar::new(source.content_length().unwrap_or(0)));
-            // https://github.com/console-rs/indicatif/blob/main/examples/download.rs
-            dl_bar.set_style(ProgressStyle::with_template("Download Progress: [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({eta})").unwrap().with_key("eta", |state: &ProgressState, w: &mut dyn Write| write!(w, "{:.1}s", state.eta().as_secs_f64()).unwrap())
-        .progress_chars("#>-"));
-            let xz_bar = multibar.add(ProgressBar::new(source.content_length().unwrap_or(0)));
-            // https://github.com/console-rs/indicatif/blob/main/examples/download.rs
-            xz_bar.set_style(
-                ProgressStyle::with_template("Decompression: [{elapsed_precise}] {bytes}").unwrap(),
-            );
+        //     multibar.set_move_cursor(true); // Reduce flickering
+        //     let dl_bar = multibar.add(ProgressBar::new(source.content_length().unwrap_or(0)));
+        //     // https://github.com/console-rs/indicatif/blob/main/examples/download.rs
+        //     dl_bar.set_style(ProgressStyle::with_template("Download Progress: [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({eta})").unwrap().with_key("eta", |state: &ProgressState, w: &mut dyn Write| write!(w, "{:.1}s", state.eta().as_secs_f64()).unwrap())
+        // .progress_chars("#>-"));
+        //     let xz_bar = multibar.add(ProgressBar::new(source.content_length().unwrap_or(0)));
+        //     // https://github.com/console-rs/indicatif/blob/main/examples/download.rs
+        //     xz_bar.set_style(
+        //         ProgressStyle::with_template("Decompression: [{elapsed_precise}] {bytes}").unwrap(),
+        //     );
 
-            // Stream the download body
-            let tarball_stream = dl_bar.wrap_async_read(StreamReader::new(
-                source
-                    .bytes_stream()
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
-            ));
-            // Convert async IO to sync IO to do live XZ decoding
-            let decoded_tarball = xz_bar.wrap_read(XzDecoder::new_multi_decoder(
-                SyncIoBridge::new(tarball_stream),
-            ));
-            // Write out the tarball
-            thread::spawn(|| Archive::new(decoded_tarball).unpack(sysroot).unwrap())
-                .join()
-                .unwrap();
-            println!("Downloaded sysroot");
+        //     // Stream the download body
+        //     let tarball_stream = dl_bar.wrap_async_read(StreamReader::new(
+        //         source
+        //             .bytes_stream()
+        //             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
+        //     ));
+        //     // Convert async IO to sync IO to do live XZ decoding
+        //     let decoded_tarball = xz_bar.wrap_read(XzDecoder::new_multi_decoder(
+        //         SyncIoBridge::new(tarball_stream),
+        //     ));
+        //     // Write out the tarball
+        //     thread::spawn(|| Archive::new(decoded_tarball).unpack(sysroot).unwrap())
+        //         .join()
+        //         .unwrap();
+        //     println!("Downloaded sysroot");
         } else {
             println!("Found sysroot");
         }
@@ -113,7 +115,10 @@ async fn main() {
             "/usr/local/cuda-10.2/targets/aarch64-linux/lib/ -L"
         }
         + sysroot_str
-        + "/opt/opencv-4.6.0/lib/";
+        + "/usr/lib/aarch64-linux-gnu/";
+        // + sysroot_str
+        // + "/lib/aarch64-linux-gnu/";
+    println!("Shared flags: {shared_flags}");
     // Only to clang to compile C code
     let cflags = &shared_flags;
     // Only to clang++ to compile C++ code
@@ -152,29 +157,40 @@ async fn main() {
     );
 
     // Need sysroot fully downloaded to system to search
-    get_sysroot.await.unwrap();
+    get_sysroot.await.unwrap_or_else(|e| std::process::exit(1));
 
     // OpenCV setup
-    let opencv_link_libs: String = WalkDir::new(sysroot.join("./opt/opencv-4.6.0/lib/"))
+    let mut opencv_link_libs: String = WalkDir::new(sysroot.join("./usr/lib/aarch64-linux-gnu/"))
         .max_depth(1)
         .into_iter()
         .filter_map(|e| e.ok())
         .map(|f| f.file_name().to_string_lossy().to_string())
-        .filter(|f| f.ends_with(".so"))
+        .filter(|f| f.ends_with(".so") && f.starts_with("lib"))
         .map(|f| ",".to_string() + &f[3..f.len() - 3])
-        .collect(); // remove beginning "lib" and ending ".so"
+        .collect();
+    // let opencv_link_libs2: String = WalkDir::new(sysroot.join("./lib/aarch64-linux-gnu/"))
+    //         .max_depth(1)
+    //         .into_iter()
+    //         .filter_map(|e| e.ok())
+    //         .map(|f| f.file_name().to_string_lossy().to_string())
+    //         .filter(|f| f.ends_with(".so") && f.starts_with("lib"))
+    //         .map(|f| ",".to_string() + &f[3..f.len() - 3])
+    //         .collect(); // remove beginning "lib" and ending ".so"
+    // opencv_link_libs.push_str(&opencv_link_libs2);
+    dbg!(&opencv_link_libs);
     set_var("OPENCV_LINK_LIBS", opencv_link_libs);
-    set_var("OPENCV_LINK_PATHS", sysroot.join("./opt/opencv-4.6.0/lib/"));
+    // set_var("OPENCV_LINK_PATHS", sysroot.join("./usr/lib/aarch64-linux-gnu/").to_str().unwrap().to_string() + "," + sysroot.join("./lib/aarch64-linux-gnu/").to_str().unwrap());
+    set_var("OPENCV_LINK_PATHS", sysroot.join("./usr/lib/aarch64-linux-gnu/"));
     set_var(
         "OPENCV_INCLUDE_PATHS",
         sysroot
-            .join("./opt/opencv-4.6.0/include/opencv4")
+            .join("./usr/include/opencv4")
             .to_str()
             .unwrap()
             .to_string()
             + ","
             + sysroot
-                .join("./opt/opencv-4.6.0/include/opencv4/opencv2")
+                .join("./usr/include/opencv4/opencv2")
                 .to_str()
                 .unwrap(),
     );
